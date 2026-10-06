@@ -28,6 +28,7 @@ use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Facades\Auth;
 use Prologue\Alerts\AlertsMessageBag;
 use Pterodactyl\Contracts\Repository\SettingsRepositoryInterface;
+use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Models\Server;
 
 /**
@@ -119,6 +120,55 @@ class AntiRusuh
         app(AlertsMessageBag::class)->danger($message)->flash();
 
         throw new HttpResponseException(redirect('/admin/servers'));
+    }
+
+    /**
+     * 403 untuk semua kecuali Admin ID 1 (hanya berlaku saat Anti Rusuh ON).
+     */
+    public static function abortUnlessSuper(string $message = 'Akses ditolak'): void
+    {
+        if (self::restricts()) {
+            abort(403, trim($message));
+        }
+    }
+
+    /**
+     * Sama seperti di atas tapi SELALU berlaku (dipakai untuk halaman Settings).
+     */
+    public static function abortUnlessSuperAlways(string $message = 'Akses ditolak'): void
+    {
+        if (!self::isSuperAdmin()) {
+            abort(403, trim($message));
+        }
+    }
+
+    /**
+     * Alert merah + kembali ke halaman sebelumnya, hanya saat Anti Rusuh ON.
+     */
+    public static function denyUnlessSuper(string $message): void
+    {
+        if (self::restricts()) {
+            throw new DisplayException(trim($message));
+        }
+    }
+
+    /**
+     * Hapus server: hanya Admin ID 1 atau pemilik server.
+     */
+    public static function guardDelete(Server $server): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = Auth::user();
+        if (!$user || (int) $user->id === 1) {
+            return; // CLI / background job tetap jalan
+        }
+
+        if ((int) $server->owner_id !== (int) $user->id) {
+            throw new DisplayException('Anti Delete Server');
+        }
     }
 
     /**

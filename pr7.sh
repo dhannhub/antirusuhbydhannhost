@@ -1,10 +1,17 @@
 #!/bin/bash
 
-REMOTE_PATH="/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/FileController.php"
-TIMESTAMP=$(date -u +"%Y-%m-%d-%H-%M-%S")
-BACKUP_PATH="${REMOTE_PATH}.bak_${TIMESTAMP}"
+echo "🚀 Memasang Proteksi Anti Akses File Server..."
 
-echo "🚀 Memasang proteksi Anti Akses Server File Controller..."
+PHP_BIN="$(command -v php)"
+if [ -z "$PHP_BIN" ]; then
+  echo "❌ php tidak ditemukan di server panel"
+  exit 1
+fi
+
+if [ ! -d "/var/www/pterodactyl/app" ]; then
+  echo "❌ Panel Pterodactyl tidak ditemukan di /var/www/pterodactyl"
+  exit 1
+fi
 
 # --- Anti Rusuh helper (dipakai semua proteksi, dipasang otomatis) ---
 PANEL_DIR="/var/www/pterodactyl"
@@ -19,6 +26,7 @@ use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Facades\Auth;
 use Prologue\Alerts\AlertsMessageBag;
 use Pterodactyl\Contracts\Repository\SettingsRepositoryInterface;
+use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Models\Server;
 
 /**
@@ -113,6 +121,55 @@ class AntiRusuh
     }
 
     /**
+     * 403 untuk semua kecuali Admin ID 1 (hanya berlaku saat Anti Rusuh ON).
+     */
+    public static function abortUnlessSuper(string $message = 'Akses ditolak'): void
+    {
+        if (self::restricts()) {
+            abort(403, trim($message));
+        }
+    }
+
+    /**
+     * Sama seperti di atas tapi SELALU berlaku (dipakai untuk halaman Settings).
+     */
+    public static function abortUnlessSuperAlways(string $message = 'Akses ditolak'): void
+    {
+        if (!self::isSuperAdmin()) {
+            abort(403, trim($message));
+        }
+    }
+
+    /**
+     * Alert merah + kembali ke halaman sebelumnya, hanya saat Anti Rusuh ON.
+     */
+    public static function denyUnlessSuper(string $message): void
+    {
+        if (self::restricts()) {
+            throw new DisplayException(trim($message));
+        }
+    }
+
+    /**
+     * Hapus server: hanya Admin ID 1 atau pemilik server.
+     */
+    public static function guardDelete(Server $server): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = Auth::user();
+        if (!$user || (int) $user->id === 1) {
+            return; // CLI / background job tetap jalan
+        }
+
+        if ((int) $server->owner_id !== (int) $user->id) {
+            throw new DisplayException('Anti Delete Server');
+        }
+    }
+
+    /**
      * Simpan nilai toggle dari form Settings. Hanya Admin ID 1 yang boleh mengubah.
      */
     public static function saveFromRequest($request): void
@@ -131,273 +188,122 @@ AR_HELPER_EOF
 chmod 644 "$AR_HELPER"
 # ---------------------------------------------------------------------
 
-if [ -f "$REMOTE_PATH" ]; then
-  mv "$REMOTE_PATH" "$BACKUP_PATH"
-  echo "📦 Backup file lama dibuat di $BACKUP_PATH"
+AR_TMP="$(mktemp -d)"
+chmod 755 "$AR_TMP"
+
+cat > "$AR_TMP/patch.php" <<'AR_PATCH_EOF'
+<?php
+$panel = $argv[1];
+$ts = gmdate('Y-m-d-H-i-s');
+$GLOBALS['ar_failed'] = false;
+
+function ar_has(string $text, array $sigs): bool
+{
+    foreach ($sigs as $s) {
+        if (strpos($text, $s) !== false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Kalau file hasil "timpa penuh" versi lama terdeteksi, kembalikan dulu file asli dari backup tertua yang bersih.
+function ar_restore_legacy(string $path, array $sigs): void
+{
+    global $ts;
+    if (!is_file($path) || !ar_has(file_get_contents($path), $sigs)) {
+        return;
+    }
+    $backups = glob($path . '.bak_*') ?: [];
+    sort($backups);
+    foreach ($backups as $b) {
+        if (!ar_has(file_get_contents($b), $sigs)) {
+            copy($path, $path . '.legacy_' . $ts);
+            copy($b, $path);
+            echo "♻️  " . basename($path) . ": versi timpa-penuh lama dikembalikan ke file asli\n";
+            return;
+        }
+    }
+    echo "⚠️  " . basename($path) . ": terdeteksi versi lama tapi backup asli tidak ditemukan\n";
+    $GLOBALS['ar_failed'] = true;
+}
+
+function ar_patch(string $path, string $marker, callable $fn, string $label): void
+{
+    global $ts;
+    if (!is_file($path)) {
+        echo "⚠️  $label: file tidak ditemukan ($path)\n";
+        $GLOBALS['ar_failed'] = true;
+        return;
+    }
+    $src = file_get_contents($path);
+    if (strpos($src, $marker) !== false) {
+        echo "✔️  $label: sudah terpasang\n";
+        return;
+    }
+    $out = $fn($src);
+    if ($out === null || $out === $src) {
+        echo "⚠️  $label: pola kode tidak cocok dengan versi panel ini\n";
+        $GLOBALS['ar_failed'] = true;
+        return;
+    }
+    $backup = $path . '.bak_' . $ts;
+    if (!is_file($backup)) {
+        copy($path, $backup);
+    }
+    file_put_contents($path, $out);
+    $lint = [];
+    exec(escapeshellarg(PHP_BINARY) . ' -l ' . escapeshellarg($path) . ' 2>&1', $lint, $rc);
+    if ($rc !== 0) {
+        file_put_contents($path, $src);
+        echo "❌ $label: hasil patch error sintaks, dibatalkan (file dikembalikan)\n";
+        $GLOBALS['ar_failed'] = true;
+        return;
+    }
+    echo "✅ $label: terpasang\n";
+}
+
+// Sisipkan $code tepat setelah "{" pembuka method public yang namanya cocok.
+function ar_inject_methods(string $src, string $namePattern, string $code, string $paramNeedle = ''): array
+{
+    $count = 0;
+    $out = preg_replace_callback(
+        '/(public\s+function\s+(' . $namePattern . ')\s*\(([^)]*)\)\s*(?::\s*[\w\\\\|?]+\s*)?\{)/',
+        function ($m) use (&$count, $code, $paramNeedle) {
+            if ($m[2] === '__construct') {
+                return $m[1];
+            }
+            if ($paramNeedle !== '' && strpos($m[3], $paramNeedle) === false) {
+                return $m[1];
+            }
+            $count++;
+            return $m[1] . "\n        " . $code;
+        },
+        $src
+    );
+    return [$out, $count];
+}
+
+
+$f = "$panel/app/Http/Controllers/Api/Client/Servers/FileController.php";
+ar_restore_legacy($f, ['checkServerAccess']);
+ar_patch($f, 'AntiRusuh::guardServer', function ($src) {
+    [$out, $n] = ar_inject_methods($src, '\w+', "\\Pterodactyl\\Helpers\\AntiRusuh::guardServer(\$server);", 'Server $server');
+    return $n ? $out : null;
+}, 'V7 Anti Akses File Server');
+
+exit($GLOBALS['ar_failed'] ? 4 : 0);
+AR_PATCH_EOF
+chmod 644 "$AR_TMP/patch.php"
+
+"$PHP_BIN" "$AR_TMP/patch.php" "$PANEL_DIR"
+AR_RC=$?
+rm -rf "$AR_TMP"
+
+if [ "$AR_RC" -ne 0 ]; then
+  echo "❌ Proteksi Anti Akses File Server gagal dipasang (kode $AR_RC), cek pesan di atas"
+  exit "$AR_RC"
 fi
 
-mkdir -p "$(dirname "$REMOTE_PATH")"
-chmod 755 "$(dirname "$REMOTE_PATH")"
-
-cat > "$REMOTE_PATH" << 'EOF'
-<?php
-
-namespace Pterodactyl\Http\Controllers\Api\Client\Servers;
-
-use Pterodactyl\Helpers\AntiRusuh;
-use Carbon\CarbonImmutable;
-use Illuminate\Http\Response;
-use Illuminate\Http\JsonResponse;
-use Pterodactyl\Models\Server;
-use Pterodactyl\Facades\Activity;
-use Pterodactyl\Services\Nodes\NodeJWTService;
-use Pterodactyl\Repositories\Wings\DaemonFileRepository;
-use Pterodactyl\Transformers\Api\Client\FileObjectTransformer;
-use Pterodactyl\Http\Controllers\Api\Client\ClientApiController;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CopyFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\PullFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\ListFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\ChmodFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\DeleteFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\RenameFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CreateFolderRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CompressFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\DecompressFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\GetFileContentsRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\WriteFileContentRequest;
-
-class FileController extends ClientApiController
-{
-    public function __construct(
-        private NodeJWTService $jwtService,
-        private DaemonFileRepository $fileRepository
-    ) {
-        parent::__construct();
-    }
-
-    /**
-     * 🔒 Fungsi tambahan: Cegah akses server orang lain.
-     */
-    private function checkServerAccess($request, Server $server)
-    {
-        $user = $request->user();
-
-        // Anti Rusuh OFF di Settings -> tidak ada pembatasan
-        if (!AntiRusuh::enabled()) {
-            return;
-        }
-
-        // Admin (user id = 1) bebas akses semua
-        if ($user->id === 1) {
-            return;
-        }
-
-        // Jika server bukan milik user, tolak akses
-        if ($server->owner_id !== $user->id) {
-            AntiRusuh::deny();
-        }
-    }
-
-    public function directory(ListFilesRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
-
-        $contents = $this->fileRepository
-            ->setServer($server)
-            ->getDirectory($request->get('directory') ?? '/');
-
-        return $this->fractal->collection($contents)
-            ->transformWith($this->getTransformer(FileObjectTransformer::class))
-            ->toArray();
-    }
-
-    public function contents(GetFileContentsRequest $request, Server $server): Response
-    {
-        $this->checkServerAccess($request, $server);
-
-        $response = $this->fileRepository->setServer($server)->getContent(
-            $request->get('file'),
-            config('pterodactyl.files.max_edit_size')
-        );
-
-        Activity::event('server:file.read')->property('file', $request->get('file'))->log();
-
-        return new Response($response, Response::HTTP_OK, ['Content-Type' => 'text/plain']);
-    }
-
-    public function download(GetFileContentsRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
-
-        $token = $this->jwtService
-            ->setExpiresAt(CarbonImmutable::now()->addMinutes(15))
-            ->setUser($request->user())
-            ->setClaims([
-                'file_path' => rawurldecode($request->get('file')),
-                'server_uuid' => $server->uuid,
-            ])
-            ->handle($server->node, $request->user()->id . $server->uuid);
-
-        Activity::event('server:file.download')->property('file', $request->get('file'))->log();
-
-        return [
-            'object' => 'signed_url',
-            'attributes' => [
-                'url' => sprintf(
-                    '%s/download/file?token=%s',
-                    $server->node->getConnectionAddress(),
-                    $token->toString()
-                ),
-            ],
-        ];
-    }
-
-    public function write(WriteFileContentRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->putContent($request->get('file'), $request->getContent());
-
-        Activity::event('server:file.write')->property('file', $request->get('file'))->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function create(CreateFolderRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->createDirectory($request->input('name'), $request->input('root', '/'));
-
-        Activity::event('server:file.create-directory')
-            ->property('name', $request->input('name'))
-            ->property('directory', $request->input('root'))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function rename(RenameFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->renameFiles($request->input('root'), $request->input('files'));
-
-        Activity::event('server:file.rename')
-            ->property('directory', $request->input('root'))
-            ->property('files', $request->input('files'))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function copy(CopyFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->copyFile($request->input('location'));
-
-        Activity::event('server:file.copy')->property('file', $request->input('location'))->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function compress(CompressFilesRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
-
-        $file = $this->fileRepository->setServer($server)->compressFiles(
-            $request->input('root'),
-            $request->input('files')
-        );
-
-        Activity::event('server:file.compress')
-            ->property('directory', $request->input('root'))
-            ->property('files', $request->input('files'))
-            ->log();
-
-        return $this->fractal->item($file)
-            ->transformWith($this->getTransformer(FileObjectTransformer::class))
-            ->toArray();
-    }
-
-    public function decompress(DecompressFilesRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        set_time_limit(300);
-
-        $this->fileRepository->setServer($server)->decompressFile(
-            $request->input('root'),
-            $request->input('file')
-        );
-
-        Activity::event('server:file.decompress')
-            ->property('directory', $request->input('root'))
-            ->property('files', $request->input('file'))
-            ->log();
-
-        return new JsonResponse([], JsonResponse::HTTP_NO_CONTENT);
-    }
-
-    public function delete(DeleteFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->deleteFiles(
-            $request->input('root'),
-            $request->input('files')
-        );
-
-        Activity::event('server:file.delete')
-            ->property('directory', $request->input('root'))
-            ->property('files', $request->input('files'))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function chmod(ChmodFilesRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->chmodFiles(
-            $request->input('root'),
-            $request->input('files')
-        );
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function pull(PullFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->pull(
-            $request->input('url'),
-            $request->input('directory'),
-            $request->safe(['filename', 'use_header', 'foreground'])
-        );
-
-        Activity::event('server:file.pull')
-            ->property('directory', $request->input('directory'))
-            ->property('url', $request->input('url'))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-}
-EOF
-
-chmod 644 "$REMOTE_PATH"
-
-echo "✅ Proteksi Anti Akses Server File Controller berhasil dipasang!"
-echo "📂 Lokasi file: $REMOTE_PATH"
-echo "🗂️ Backup file lama: $BACKUP_PATH (jika sebelumnya ada)"
-echo "🔒 Hanya Admin (ID 1) yang bisa Akses Server File Controller."
+echo "✅ Proteksi Anti Akses File Server berhasil dipasang!"
+echo "⚙️  Ikut toggle Anti Rusuh (Admin -> Settings), default ON"
