@@ -958,7 +958,6 @@ mkdir -p "$(dirname "$PANEL_DIR/resources/views/antirusuh/support-widget.blade.p
 cat > "$PANEL_DIR/resources/views/antirusuh/support-widget.blade.php" <<'AR_F6_EOF'
 @if (\Pterodactyl\Helpers\AntiRusuhLog::flag('support') && \Illuminate\Support\Facades\Auth::check())
 <div id="ar-sp-root" data-token="{{ csrf_token() }}">
-    <button id="ar-sp-btn" type="button">&#128161; Report / Ide</button>
     <div id="ar-sp-modal" style="display:none;">
         <div id="ar-sp-box">
             <div id="ar-sp-title">Kirim Report / Ide</div>
@@ -977,8 +976,6 @@ cat > "$PANEL_DIR/resources/views/antirusuh/support-widget.blade.php" <<'AR_F6_E
 </div>
 @verbatim
 <style>
-#ar-sp-btn{position:fixed;top:64px;right:14px;z-index:9998;padding:6px 12px;border:0;border-radius:999px;background:#2563eb;color:#fff;font:600 12px/1.2 sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35)}
-#ar-sp-btn:hover{background:#1d4ed8}
 #ar-sp-modal{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);align-items:center;justify-content:center}
 #ar-sp-box{width:92%;max-width:420px;background:#1f2937;color:#e5e7eb;border-radius:10px;padding:16px;font:14px/1.4 sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.5)}
 #ar-sp-title{font-weight:700;font-size:16px;margin-bottom:10px}
@@ -994,7 +991,6 @@ cat > "$PANEL_DIR/resources/views/antirusuh/support-widget.blade.php" <<'AR_F6_E
 (function () {
   var root = document.getElementById('ar-sp-root');
   if (!root) return;
-  var btn = document.getElementById('ar-sp-btn');
   var modal = document.getElementById('ar-sp-modal');
   var msg = document.getElementById('ar-sp-msg');
   var type = document.getElementById('ar-sp-type');
@@ -1003,7 +999,31 @@ cat > "$PANEL_DIR/resources/views/antirusuh/support-widget.blade.php" <<'AR_F6_E
   function setStatus(text, ok) { status.textContent = text || ''; status.style.color = ok ? '#34d399' : '#f87171'; }
   function open() { modal.style.display = 'flex'; setStatus(''); msg.focus(); }
   function close() { modal.style.display = 'none'; }
-  btn.addEventListener('click', open);
+  // Ikon amplop di navbar atas (sebelah search). Gaya mengikuti item navbar lain karena sama-sama <button> di dalam navbar.
+  var NAV_ID = 'ar-sp-nav';
+  var ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 7l9 6 9-6"></path></svg>';
+  function mount() {
+    if (document.getElementById(NAV_ID)) return;
+    var account = document.querySelector('a[href="/account"]');
+    if (!account || !account.parentElement) return;
+    var bar = account.parentElement;
+    var item = document.createElement('button');
+    item.id = NAV_ID;
+    item.type = 'button';
+    item.title = 'Report / Beri Ide';
+    item.setAttribute('aria-label', 'Report / Beri Ide');
+    item.innerHTML = ICON;
+    item.addEventListener('click', open);
+    var first = bar.firstElementChild;
+    if (first && first.nextSibling) { bar.insertBefore(item, first.nextSibling); } else { bar.appendChild(item); }
+  }
+  var queued = false;
+  new MutationObserver(function () {
+    if (queued || document.getElementById(NAV_ID)) return;
+    queued = true;
+    requestAnimationFrame(function () { queued = false; mount(); });
+  }).observe(document.body, { childList: true, subtree: true });
+  mount();
   document.getElementById('ar-sp-cancel').addEventListener('click', close);
   modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
   send.addEventListener('click', function () {
