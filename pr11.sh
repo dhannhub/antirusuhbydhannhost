@@ -1132,7 +1132,7 @@ function ar_restore_legacy(string $path, array $sigs): void
     $GLOBALS['ar_failed'] = true;
 }
 
-function ar_patch(string $path, string $marker, callable $fn, string $label): void
+function ar_patch(string $path, string $marker, callable $fn, string $label, bool $required = true): void
 {
     global $ts;
     if (!is_file($path)) {
@@ -1148,7 +1148,9 @@ function ar_patch(string $path, string $marker, callable $fn, string $label): vo
     $out = $fn($src);
     if ($out === null || $out === $src) {
         echo "⚠️  $label: pola kode tidak cocok dengan versi panel ini\n";
-        $GLOBALS['ar_failed'] = true;
+        if ($required) {
+            $GLOBALS['ar_failed'] = true;
+        }
         return;
     }
     $backup = $path . '.bak_' . $ts;

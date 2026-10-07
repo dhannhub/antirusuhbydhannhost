@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🚀 Memasang Proteksi Anti Hapus & Ubah User..."
+echo "🚀 Memasang Proteksi Anti Hapus & Ubah User + Application API..."
 
 PHP_BIN="$(command -v php)"
 if [ -z "$PHP_BIN" ]; then
@@ -27,6 +27,7 @@ use Illuminate\Support\Facades\Auth;
 use Prologue\Alerts\AlertsMessageBag;
 use Pterodactyl\Contracts\Repository\SettingsRepositoryInterface;
 use Pterodactyl\Exceptions\DisplayException;
+use Pterodactyl\Models\ApiKey;
 use Pterodactyl\Models\Server;
 
 /**
@@ -106,7 +107,7 @@ class AntiRusuh
     /**
      * API/JSON -> 403 dengan pesan. Halaman admin -> kembali ke daftar server + alert.
      */
-    public static function deny(?string $message = null): void
+    public static function deny(?string $message = null, string $redirectTo = '/admin/servers'): void
     {
         $message = $message ?: self::MESSAGE;
         $request = request();
@@ -117,7 +118,7 @@ class AntiRusuh
 
         app(AlertsMessageBag::class)->danger($message)->flash();
 
-        throw new HttpResponseException(redirect('/admin/servers'));
+        throw new HttpResponseException(redirect($redirectTo));
     }
 
     /**
@@ -147,6 +148,36 @@ class AntiRusuh
     {
         if (self::restricts()) {
             throw new DisplayException(trim($message));
+        }
+    }
+
+    /**
+     * Daftar Application API key: hanya key milik sendiri yang terlihat (Admin ID 1 tidak dibatasi).
+     */
+    public static function ownKeys($keys, $user = null)
+    {
+        $user = $user ?? Auth::user();
+        if (!self::restricts($user)) {
+            return $keys;
+        }
+
+        return collect($keys)->filter(function ($key) use ($user) {
+            return $user && (int) $key->user_id === (int) $user->id;
+        })->values();
+    }
+
+    /**
+     * Hapus Application API key: hanya boleh key milik sendiri.
+     */
+    public static function guardApiKey(string $identifier): void
+    {
+        if (!self::restricts()) {
+            return;
+        }
+
+        $key = ApiKey::query()->where('identifier', $identifier)->first();
+        if ($key && (int) $key->user_id !== (int) (Auth::user()->id ?? 0)) {
+            self::deny(null, '/admin/api');
         }
     }
 
@@ -228,7 +259,7 @@ function ar_restore_legacy(string $path, array $sigs): void
     $GLOBALS['ar_failed'] = true;
 }
 
-function ar_patch(string $path, string $marker, callable $fn, string $label): void
+function ar_patch(string $path, string $marker, callable $fn, string $label, bool $required = true): void
 {
     global $ts;
     if (!is_file($path)) {
@@ -244,7 +275,9 @@ function ar_patch(string $path, string $marker, callable $fn, string $label): vo
     $out = $fn($src);
     if ($out === null || $out === $src) {
         echo "⚠️  $label: pola kode tidak cocok dengan versi panel ini\n";
-        $GLOBALS['ar_failed'] = true;
+        if ($required) {
+            $GLOBALS['ar_failed'] = true;
+        }
         return;
     }
     $backup = $path . '.bak_' . $ts;
@@ -293,6 +326,20 @@ ar_patch($f, 'AntiRusuh::denyUnlessSuper', function ($src) {
     return ($n1 + $n2) ? $out : null;
 }, 'V2 Anti Hapus & Ubah User');
 
+// Application API (Admin -> Application API): hanya key milik sendiri yang terlihat & bisa dihapus
+$g = "$panel/app/Http/Controllers/Admin/ApiController.php";
+ar_patch($g, 'AntiRusuh::ownKeys', function ($src) {
+    $n = 0;
+    $out = preg_replace_callback('/(\$this->repository->getApplicationKeys\(\$request->user\(\)\))/', function ($m) {
+        return "\\Pterodactyl\\Helpers\\AntiRusuh::ownKeys(" . $m[1] . ", \$request->user())";
+    }, $src, -1, $n);
+    return $n ? $out : null;
+}, 'V2 Application API: key orang lain tidak terlihat', false);
+ar_patch($g, 'AntiRusuh::guardApiKey', function ($src) {
+    [$out, $n] = ar_inject_methods($src, 'delete', "\\Pterodactyl\\Helpers\\AntiRusuh::guardApiKey(\$identifier);", '$identifier');
+    return $n ? $out : null;
+}, 'V2 Application API: tidak bisa hapus key orang lain');
+
 exit($GLOBALS['ar_failed'] ? 4 : 0);
 AR_PATCH_EOF
 chmod 644 "$AR_TMP/patch.php"
@@ -302,9 +349,9 @@ AR_RC=$?
 rm -rf "$AR_TMP"
 
 if [ "$AR_RC" -ne 0 ]; then
-  echo "❌ Proteksi Anti Hapus & Ubah User gagal dipasang (kode $AR_RC), cek pesan di atas"
+  echo "❌ Proteksi Anti Hapus & Ubah User + Application API gagal dipasang (kode $AR_RC), cek pesan di atas"
   exit "$AR_RC"
 fi
 
-echo "✅ Proteksi Anti Hapus & Ubah User berhasil dipasang!"
+echo "✅ Proteksi Anti Hapus & Ubah User + Application API berhasil dipasang!"
 echo "⚙️  Ikut toggle Anti Rusuh (Admin -> Settings), default ON"
