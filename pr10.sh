@@ -154,6 +154,68 @@ class AntiRusuh
     }
 
     /**
+     * User yang sedang beraksi: sesi login, atau pemilik Application API key kalau request memakai API key.
+     */
+    public static function actingUser()
+    {
+        $user = Auth::user();
+        if ($user) {
+            return $user;
+        }
+
+        try {
+            $key = request()->attributes->get('api_key');
+            if ($key && !empty($key->user_id)) {
+                return \Pterodactyl\Models\User::query()->find($key->user_id);
+            }
+        } catch (\Throwable $e) {
+            // tidak ada konteks request (CLI/queue)
+        }
+
+        return null;
+    }
+
+    /**
+     * Hapus user (panel maupun Application API): hanya Admin ID 1.
+     */
+    public static function guardUserDelete(): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = self::actingUser();
+        if (!$user || (int) $user->id === 1) {
+            return; // CLI / background job tetap jalan
+        }
+
+        throw new DisplayException('Jangan hapus akun orang');
+    }
+
+    /**
+     * Ubah user (panel maupun Application API): hanya Admin ID 1.
+     * Mengubah akun sendiri (halaman Account: email/password) tetap boleh.
+     */
+    public static function guardUserChange($target): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = self::actingUser();
+        if (!$user || (int) $user->id === 1) {
+            return;
+        }
+
+        $targetId = is_object($target) ? ($target->id ?? null) : $target;
+        if ((int) $targetId === (int) $user->id) {
+            return;
+        }
+
+        throw new DisplayException('Data hanya bisa diubah oleh admin ID 1.');
+    }
+
+    /**
      * Daftar Application API key: hanya key milik sendiri yang terlihat (Admin ID 1 tidak dibatasi).
      */
     public static function ownKeys($keys, $user = null)
@@ -192,7 +254,7 @@ class AntiRusuh
             return;
         }
 
-        $user = Auth::user();
+        $user = self::actingUser();
         if (!$user || (int) $user->id === 1) {
             return; // CLI / background job tetap jalan
         }

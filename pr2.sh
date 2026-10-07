@@ -152,6 +152,68 @@ class AntiRusuh
     }
 
     /**
+     * User yang sedang beraksi: sesi login, atau pemilik Application API key kalau request memakai API key.
+     */
+    public static function actingUser()
+    {
+        $user = Auth::user();
+        if ($user) {
+            return $user;
+        }
+
+        try {
+            $key = request()->attributes->get('api_key');
+            if ($key && !empty($key->user_id)) {
+                return \Pterodactyl\Models\User::query()->find($key->user_id);
+            }
+        } catch (\Throwable $e) {
+            // tidak ada konteks request (CLI/queue)
+        }
+
+        return null;
+    }
+
+    /**
+     * Hapus user (panel maupun Application API): hanya Admin ID 1.
+     */
+    public static function guardUserDelete(): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = self::actingUser();
+        if (!$user || (int) $user->id === 1) {
+            return; // CLI / background job tetap jalan
+        }
+
+        throw new DisplayException('Jangan hapus akun orang');
+    }
+
+    /**
+     * Ubah user (panel maupun Application API): hanya Admin ID 1.
+     * Mengubah akun sendiri (halaman Account: email/password) tetap boleh.
+     */
+    public static function guardUserChange($target): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $user = self::actingUser();
+        if (!$user || (int) $user->id === 1) {
+            return;
+        }
+
+        $targetId = is_object($target) ? ($target->id ?? null) : $target;
+        if ((int) $targetId === (int) $user->id) {
+            return;
+        }
+
+        throw new DisplayException('Data hanya bisa diubah oleh admin ID 1.');
+    }
+
+    /**
      * Daftar Application API key: hanya key milik sendiri yang terlihat (Admin ID 1 tidak dibatasi).
      */
     public static function ownKeys($keys, $user = null)
@@ -190,7 +252,7 @@ class AntiRusuh
             return;
         }
 
-        $user = Auth::user();
+        $user = self::actingUser();
         if (!$user || (int) $user->id === 1) {
             return; // CLI / background job tetap jalan
         }
@@ -339,6 +401,16 @@ ar_patch($g, 'AntiRusuh::guardApiKey', function ($src) {
     [$out, $n] = ar_inject_methods($src, 'delete', "\\Pterodactyl\\Helpers\\AntiRusuh::guardApiKey(\$identifier);", '$identifier');
     return $n ? $out : null;
 }, 'V2 Application API: tidak bisa hapus key orang lain');
+
+// Jalur service (dipakai Application API juga): hapus & ubah user hanya Admin ID 1
+ar_patch("$panel/app/Services/Users/UserDeletionService.php", 'AntiRusuh::guardUserDelete', function ($src) {
+    [$out, $n] = ar_inject_methods($src, 'handle', "\\Pterodactyl\\Helpers\\AntiRusuh::guardUserDelete();");
+    return $n ? $out : null;
+}, 'V2 Anti hapus user (termasuk lewat API)');
+ar_patch("$panel/app/Services/Users/UserUpdateService.php", 'AntiRusuh::guardUserChange', function ($src) {
+    [$out, $n] = ar_inject_methods($src, 'handle', "\\Pterodactyl\\Helpers\\AntiRusuh::guardUserChange(\$user);", 'User $user');
+    return $n ? $out : null;
+}, 'V2 Anti ubah user orang (termasuk lewat API)');
 
 exit($GLOBALS['ar_failed'] ? 4 : 0);
 AR_PATCH_EOF
