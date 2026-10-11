@@ -285,7 +285,7 @@ function ar_inject_methods(string $src, string $namePattern, string $code, strin
 }
 
 
-$f1 = "$panel/app/Http/Controllers/Admin/Api/ApplicationApiController.php";
+$f1 = "$panel/app/Http/Controllers/Admin/ApiController.php";
 ar_patch($f1, 'AntiRusuh::abortUnlessSuper', function ($src) {
     [$out, $n] = ar_inject_methods($src, '\w+', "\\Pterodactyl\\Helpers\\AntiRusuh::abortUnlessSuper('Akses Application API tidak diizinkan.');");
     return $n ? $out : null;
